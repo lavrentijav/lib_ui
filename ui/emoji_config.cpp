@@ -22,6 +22,7 @@
 #include <QtCore/QJsonObject>
 #include <QtCore/QFile>
 #include <QtCore/QDir>
+#include <QtGui/QFont>
 
 #include <crl/crl_async.h>
 
@@ -90,6 +91,24 @@ auto TouchbarEmoji = (Instance*)nullptr;
 
 auto MainEmojiMap = std::map<int, QPixmap>();
 auto OtherEmojiMap = base::flat_map<int, std::map<int, QPixmap>>();
+
+void DrawEmojiTextFallback(QPainter &p, EmojiPtr emoji, int size, int x, int y) {
+	Expects(emoji != nullptr);
+
+	auto font = QFont();
+#ifdef Q_OS_WIN
+	font.setFamily(QStringLiteral("Segoe UI Emoji"));
+#elif defined Q_OS_MAC // Q_OS_WIN
+	font.setFamily(QStringLiteral("Apple Color Emoji"));
+#else // Q_OS_MAC
+	font.setFamily(QStringLiteral("Noto Color Emoji"));
+#endif // !Q_OS_MAC && !Q_OS_WIN
+	font.setPixelSize(std::max(8, size - 1));
+	p.save();
+	p.setFont(font);
+	p.drawText(QRect(x, y, size, size), Qt::AlignCenter, emoji->text());
+	p.restore();
+}
 
 int RowsCount(int index) {
 	if (index + 1 < SpritesCount) {
@@ -330,7 +349,14 @@ std::vector<QImage> LoadSprites(int id) {
 	) | ranges::views::transform([&](int index) {
 		return base + QString::number(index + 1) + ".webp";
 	}) | ranges::views::transform([](const QString &path) {
-		return QImage(path, "WEBP").convertToFormat(
+		auto image = QImage(path);
+		if (image.isNull()) {
+			image = QImage(path, "WEBP");
+		}
+		if (image.isNull()) {
+			LOG(("Emoji Error: could not decode '%1'").arg(path));
+		}
+		return image.convertToFormat(
 			QImage::Format_ARGB32_Premultiplied);
 	}) | ranges::to_vector;
 }
@@ -818,6 +844,7 @@ bool Instance::cached() const {
 
 void Instance::draw(QPainter &p, EmojiPtr emoji, int x, int y) {
 	if (_unsupported) {
+		DrawEmojiTextFallback(p, emoji, _size, x, y);
 		return;
 	} else if (Universal && Universal->id() != _id) {
 		generateCache();
@@ -825,7 +852,11 @@ void Instance::draw(QPainter &p, EmojiPtr emoji, int x, int y) {
 	const auto sprite = emoji->sprite();
 	if (sprite >= _sprites.size()) {
 		Assert(Universal != nullptr);
-		Universal->draw(p, emoji, _size, x, y);
+		if (Universal->ensureLoaded()) {
+			Universal->draw(p, emoji, _size, x, y);
+		} else {
+			DrawEmojiTextFallback(p, emoji, _size, x, y);
+		}
 		return;
 	}
 	p.drawPixmap(
@@ -858,6 +889,8 @@ void Instance::checkUniversalImages() {
 		} else {
 			_unsupported = true;
 		}
+	} else {
+		_unsupported = false;
 	}
 }
 
