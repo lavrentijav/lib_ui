@@ -11,10 +11,13 @@
 #include "base/qt/qt_string_view.h"
 #include "emoji.h"
 
+#include <QtCore/QByteArray>
 #include <QtGui/QPainter>
 #include <QtGui/QPixmap>
 
 #include <rpl/producer.h>
+
+#include <mutex>
 
 namespace Ui {
 namespace Emoji {
@@ -165,15 +168,27 @@ public:
 	bool ensureLoaded();
 	void clear();
 
-	void draw(QPainter &p, EmojiPtr emoji, int size, int x, int y) const;
+	bool draw(
+		QPainter &p,
+		EmojiPtr emoji,
+		int size,
+		int x,
+		int y) const;
 
-	// This method must be thread safe and so it is called after
-	// the _id value is fixed and all _sprites are loaded.
+	// This method must be thread safe, it may decode a packed sprite.
 	QImage generate(int size, int index) const;
 
 private:
+	[[nodiscard]] QImage sprite(int index) const;
+	void touchDecoded(int index) const;
+	void evictDecoded() const;
+
 	const int _id = 0;
-	std::vector<QImage> _sprites;
+	mutable std::mutex _mutex;
+	std::vector<QByteArray> _packed;
+	mutable std::vector<QImage> _decoded;
+	mutable std::vector<int> _order;
+	bool _loaded = false;
 
 };
 

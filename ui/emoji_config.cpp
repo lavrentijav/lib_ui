@@ -23,6 +23,7 @@
 #include <QtCore/QFile>
 #include <QtCore/QDir>
 #include <QtGui/QFont>
+#include <QtGui/QImageReader>
 
 #include <crl/crl_async.h>
 
@@ -33,6 +34,7 @@ namespace {
 constexpr auto kUniversalSize = 72;
 constexpr auto kImagesPerRow = 32;
 constexpr auto kImageRowsPerSprite = 16;
+constexpr auto kDecodedSpritesLimit = 3;
 
 constexpr auto kSetVersion = uint32(8);
 constexpr auto kCacheVersion = uint32(10);
@@ -334,34 +336,13 @@ QImage LoadFromFile(int id, int size, int index) {
 	return result;
 }
 
-std::vector<QImage> LoadSprites(int id) {
-	Expects(IsValidSetId(id));
-	Expects(SpritesCount > 0);
-
-	auto result = std::vector<QImage>();
-	const auto folder = (id != 0)
-		? internal::SetDataPath(id) + '/'
-		: QStringLiteral(":/gui/emoji/");
-	const auto base = folder + "emoji_";
-	return ranges::views::ints(
-		0,
-		SpritesCount
-	) | ranges::views::transform([&](int index) {
-		return base + QString::number(index + 1) + ".webp";
-	}) | ranges::views::transform([](const QString &path) {
-		auto image = QImage(path);
-		if (image.isNull()) {
-			image = QImage(path, "WEBP");
-		}
-		if (image.isNull()) {
-			LOG(("Emoji Error: could not decode '%1'").arg(path));
-		}
-		return image.convertToFormat(
-			QImage::Format_ARGB32_Premultiplied);
-	}) | ranges::to_vector;
+QSize SpriteSize(int index) {
+	return QSize(
+		kImagesPerRow * kUniversalSize,
+		RowsCount(index) * kUniversalSize);
 }
 
-std::vector<QImage> LoadAndValidateSprites(int id) {
+std::vector<QByteArray> LoadPackedSprites(int id) {
 	Expects(IsValidSetId(id));
 	Expects(SpritesCount > 0);
 
@@ -369,21 +350,29 @@ std::vector<QImage> LoadAndValidateSprites(int id) {
 	if (config != ConfigResult::Good) {
 		return {};
 	}
-	auto result = LoadSprites(id);
-	const auto sizes = ranges::views::ints(
-		0,
-		SpritesCount
-	) | ranges::views::transform([](int index) {
-		return QSize(
-			kImagesPerRow * kUniversalSize,
-			RowsCount(index) * kUniversalSize);
-	});
-	const auto good = ranges::views::zip_with(
-		[](const QImage &data, QSize size) { return data.size() == size; },
-		result,
-		sizes);
-	if (ranges::find(good, false) != end(good)) {
-		return {};
+	const auto folder = (id != 0)
+		? internal::SetDataPath(id) + '/'
+		: QStringLiteral(":/gui/emoji/");
+	const auto base = folder + "emoji_";
+	auto result = std::vector<QByteArray>();
+	result.reserve(SpritesCount);
+	for (auto index = 0; index != SpritesCount; ++index) {
+		const auto path = base + QString::number(index + 1) + ".webp";
+		auto reader = QImageReader(path);
+		if (!reader.canRead()) {
+			reader.setFormat("WEBP");
+		}
+		if (const auto size = reader.size(); size.isValid()
+			&& size != SpriteSize(index)) {
+			LOG(("Emoji Error: unexpected sprite size '%1'").arg(path));
+			return {};
+		}
+		auto file = QFile(path);
+		if (!file.open(QIODevice::ReadOnly)) {
+			LOG(("Emoji Error: could not read '%1'").arg(path));
+			return {};
+		}
+		result.push_back(file.readAll());
 	}
 	return result;
 }
@@ -428,27 +417,90 @@ int UniversalImages::id() const {
 bool UniversalImages::ensureLoaded() {
 	Expects(SpritesCount > 0);
 
-	if (!_sprites.empty()) {
+	auto lock = std::unique_lock(_mutex);
+	if (_loaded) {
 		return true;
 	}
-	_sprites = LoadAndValidateSprites(_id);
-	return !_sprites.empty();
+	_packed = LoadPackedSprites(_id);
+	if (_packed.empty()) {
+		return false;
+	}
+	_decoded.assign(_packed.size(), QImage());
+	_order.clear();
+	_loaded = true;
+	return true;
 }
 
 void UniversalImages::clear() {
-	_sprites.clear();
+	auto lock = std::unique_lock(_mutex);
+	_packed.clear();
+	_decoded.clear();
+	_order.clear();
+	_loaded = false;
 }
 
-void UniversalImages::draw(
+QImage UniversalImages::sprite(int index) const {
+	auto packed = QByteArray();
+	{
+		auto lock = std::unique_lock(_mutex);
+		if (!_loaded || index < 0 || index >= int(_packed.size())) {
+			return QImage();
+		}
+		if (const auto &cached = _decoded[index]; !cached.isNull()) {
+			touchDecoded(index);
+			return cached;
+		}
+		packed = _packed[index];
+	}
+	auto image = QImage::fromData(packed);
+	if (image.isNull()) {
+		image = QImage::fromData(packed, "WEBP");
+	}
+	if (image.isNull()) {
+		LOG(("Emoji Error: could not decode sprite %1").arg(index));
+		return QImage();
+	}
+	image = image.convertToFormat(QImage::Format_ARGB32_Premultiplied);
+	{
+		auto lock = std::unique_lock(_mutex);
+		if (index < int(_packed.size()) && _decoded.size() == _packed.size()) {
+			_decoded[index] = image;
+			touchDecoded(index);
+			evictDecoded();
+		}
+	}
+	return image;
+}
+
+void UniversalImages::touchDecoded(int index) const {
+	const auto i = std::find(_order.begin(), _order.end(), index);
+	if (i != _order.end()) {
+		_order.erase(i);
+	}
+	_order.push_back(index);
+}
+
+void UniversalImages::evictDecoded() const {
+	while (_order.size() > kDecodedSpritesLimit) {
+		const auto old = _order.front();
+		_order.erase(_order.begin());
+		_decoded[old] = QImage();
+	}
+}
+
+bool UniversalImages::draw(
 		QPainter &p,
 		EmojiPtr emoji,
 		int size,
 		int x,
 		int y) const {
-	Expects(emoji->sprite() < _sprites.size());
+	Expects(emoji->sprite() < SpritesCount);
 
 	const auto large = kUniversalSize;
-	const auto &original = _sprites[emoji->sprite()];
+	const auto original = sprite(emoji->sprite());
+	if (original.isNull()) {
+		return false;
+	}
 	const auto data = original.bits();
 	const auto stride = original.bytesPerLine();
 	const auto format = original.format();
@@ -467,15 +519,19 @@ void UniversalImages::draw(
 		Qt::SmoothTransformation);
 	single.setDevicePixelRatio(p.device()->devicePixelRatio());
 	p.drawImage(x, y, single);
+	return true;
 }
 
 QImage UniversalImages::generate(int size, int index) const {
 	Expects(size > 0);
-	Expects(index < _sprites.size());
+	Expects(index < SpritesCount);
 
 	const auto rows = RowsCount(index);
 	const auto large = kUniversalSize;
-	const auto &original = _sprites[index];
+	const auto original = sprite(index);
+	if (original.isNull()) {
+		return QImage();
+	}
 	const auto data = original.bits();
 	const auto stride = original.bytesPerLine();
 	const auto format = original.format();
@@ -852,11 +908,11 @@ void Instance::draw(QPainter &p, EmojiPtr emoji, int x, int y) {
 	const auto sprite = emoji->sprite();
 	if (sprite >= _sprites.size()) {
 		Assert(Universal != nullptr);
-		if (Universal->ensureLoaded()) {
-			Universal->draw(p, emoji, _size, x, y);
-		} else {
-			DrawEmojiTextFallback(p, emoji, _size, x, y);
+		if (Universal->ensureLoaded()
+			&& Universal->draw(p, emoji, _size, x, y)) {
+			return;
 		}
+		DrawEmojiTextFallback(p, emoji, _size, x, y);
 		return;
 	}
 	p.drawPixmap(
@@ -914,6 +970,9 @@ void Instance::generateCache() {
 			image = std::move(image)
 		]() mutable {
 			if (universal != Universal) {
+				return;
+			}
+			if (image.isNull()) {
 				return;
 			}
 			pushSprite(std::move(image));
