@@ -6,6 +6,8 @@
 //
 #pragma once
 
+#include "ui/text/text_entity.h"
+
 #include <QtGui/QColor>
 #include <QtGui/QImage>
 #include <QtCore/QSize>
@@ -14,12 +16,15 @@
 #include <crl/crl_time.h>
 
 #include <any>
+#include <memory>
 #include <optional>
+#include <utility>
 
 class QPainter;
 
 namespace style {
 struct TextStyle;
+class palette;
 } // namespace style
 
 namespace Ui::Emoji {
@@ -84,6 +89,9 @@ public:
 	[[nodiscard]] virtual QString replacementText() {
 		return QString();
 	}
+	[[nodiscard]] virtual EntitiesInText replacementEntities() {
+		return {};
+	}
 	[[nodiscard]] virtual CustomEmojiSemantics semantics() {
 		return {};
 	}
@@ -105,6 +113,7 @@ public:
 	std::optional<CustomEmojiVerticalMetrics> vertical(
 		const style::TextStyle &st) override;
 	QString replacementText() override;
+	EntitiesInText replacementEntities() override;
 	CustomEmojiSemantics semantics() override;
 	void paint(QPainter &p, const Context &context) override;
 	void unload() override;
@@ -126,6 +135,7 @@ public:
 	std::optional<CustomEmojiVerticalMetrics> vertical(
 		const style::TextStyle &st) override;
 	QString replacementText() override;
+	EntitiesInText replacementEntities() override;
 	CustomEmojiSemantics semantics() override;
 	void paint(QPainter &p, const Context &context) override;
 	void unload() override;
@@ -149,6 +159,7 @@ public:
 	std::optional<CustomEmojiVerticalMetrics> vertical(
 		const style::TextStyle &st) override;
 	QString replacementText() override;
+	EntitiesInText replacementEntities() override;
 	CustomEmojiSemantics semantics() override;
 	void paint(QPainter &p, const Context &context) override;
 	void unload() override;
@@ -163,6 +174,17 @@ private:
 	bool _stopOnLast = false;
 
 };
+
+template <typename Wrapper, typename ...Args>
+[[nodiscard]] std::unique_ptr<CustomEmoji> MakeWrappedEmoji(
+		std::unique_ptr<CustomEmoji> wrapped,
+		Args &&...args) {
+	return wrapped
+		? std::make_unique<Wrapper>(
+			std::move(wrapped),
+			std::forward<Args>(args)...)
+		: nullptr;
+}
 
 class PaletteDependentCustomEmoji final : public CustomEmoji {
 public:
@@ -186,6 +208,7 @@ private:
 	QMargins _padding;
 	QImage _frame;
 	int _paletteVersion = 0;
+	const style::palette *_paletteOverride = nullptr;
 
 };
 

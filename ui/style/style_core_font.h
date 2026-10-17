@@ -6,11 +6,14 @@
 //
 #pragma once
 
+#include "ui/ui_fixed.h"
+
 #include "base/basic_types.h"
 #include "base/flags.h"
 
 #include <QtGui/QFont>
 #include <QtGui/QFontMetrics>
+
 
 #include <cmath>
 
@@ -60,7 +63,7 @@ using FontVariants = std::array<Font, kFontVariants>;
 class FontData;
 class Font final {
 public:
-	Font(Qt::Initialization = Qt::Uninitialized) {
+	constexpr Font(Qt::Initialization = Qt::Uninitialized) {
 	}
 	Font(int size, FontFlags flags, const QString &family);
 	Font(int size, FontFlags flags, int family);
@@ -110,6 +113,9 @@ public:
 			Qt::TextElideMode mode = Qt::ElideRight) const {
 		return _m.elidedText(str, mode, width);
 	}
+	[[nodiscard]] const QFontMetricsF &metrics() const {
+		return _m;
+	}
 
 	[[nodiscard]] Font bold(bool set = true) const;
 	[[nodiscard]] Font italic(bool set = true) const;
@@ -128,6 +134,9 @@ public:
 	int descent = 0;
 	int spacew = 0;
 	int elidew = 0;
+
+	Ui::Fixed fascent = 0;
+	Ui::Fixed fleading = 0;
 
 private:
 	friend class OwnedFont;

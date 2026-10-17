@@ -12,6 +12,7 @@
 #include "ui/text/text_isolated_emoji.h"
 #include "ui/text/text_renderer.h"
 #include "ui/text/text_word_parser.h"
+#include "ui/widgets/fields/input_field.h"
 #include "ui/widgets/tooltip.h" // FindNiceTooltipWidth.
 #include "ui/basic_click_handlers.h"
 #include "ui/integration.h"
@@ -20,6 +21,8 @@
 #include "styles/style_basic.h"
 
 #include <QtGui/QGuiApplication>
+
+#include <algorithm>
 
 namespace Ui {
 
@@ -32,6 +35,18 @@ namespace Ui::Text {
 namespace {
 
 constexpr auto kDefaultSpoilerCacheCapacity = 24;
+
+// A number no other text carries, for whatever keeps a result of laying one
+// out to tell whether that result is of the text it is looking at.
+//
+// It wraps, and that is not a hole: a number comes back only after four
+// billion texts were given to strings, and nothing worked out for a text
+// lives that long - what keeps such results keeps a handful of them and
+// throws the rest away, long before the count comes around.
+[[nodiscard]] uint NextLayoutId() {
+	static auto counter = std::atomic<uint>();
+	return ++counter;
+}
 
 [[nodiscard]] Qt::LayoutDirection StringDirection(
 		const QString &str,
@@ -85,6 +100,10 @@ bool IsParagraphSeparator(QChar ch) {
 	const auto semantics = custom->semantics();
 	return !semantics.exportEntity
 		|| !custom->replacementText().isEmpty();
+}
+
+[[nodiscard]] bool IsIvFormulaCustomEmojiData(QStringView data) {
+	return data.startsWith(u"iv-markdown:inline-text-object;formula;"_q);
 }
 
 [[nodiscard]] bool IsTrailingSkipOnlyLine(
@@ -596,15 +615,15 @@ void String::recountNaturalSize(
 	auto qpadding = quotePadding(quote);
 	auto qminwidth = quoteMinWidth(quote);
 	auto qlinesleft = quoteLinesLimit(quote);
-	auto qmaxwidth = QFixed(qminwidth);
+	auto qmaxwidth = Fixed(qminwidth);
 	auto qoldheight = 0;
 
 	_maxWidth = 0;
 	_minHeight = qpadding.top();
-	auto maxWidth = QFixed();
-	auto width = QFixed(qminwidth);
-	auto last_rBearing = QFixed();
-	auto last_rPadding = QFixed();
+	auto maxWidth = Fixed();
+	auto width = Fixed(qminwidth);
+	auto last_rBearing = Fixed();
+	auto last_rPadding = Fixed();
 	for (const auto &word : _words) {
 		if (word.newline()) {
 			const auto block = word.newlineBlockIndex();
@@ -635,7 +654,7 @@ void String::recountNaturalSize(
 			if (initial) {
 				computeParagraphDirection(word.position());
 			}
-			const auto lineHeight = resolveLineGeometry(
+			const auto lineHeight = resolveLineMetrics(
 				lastNewlineStart,
 				word.position(),
 				lineStartBlockHint).height();
@@ -674,7 +693,7 @@ void String::recountNaturalSize(
 		computeParagraphDirection(_text.size());
 	}
 	if (width > 0) {
-		const auto lineHeight = resolveLineGeometry(
+		const auto lineHeight = resolveLineMetrics(
 			lastNewlineStart,
 			_text.size(),
 			lineStartBlockHint).height();
@@ -775,6 +794,15 @@ void String::setLink(uint16 index, const ClickHandlerPtr &link) {
 	}
 }
 
+const ClickHandlerPtr &String::linkByIndex(uint16 index) const {
+	// A block with a link index past the end is a parser bug, but it
+	// should cost a dead link and not a read of whatever lies there.
+	static const auto kEmpty = ClickHandlerPtr();
+	return (_extended && index > 0 && index <= _extended->links.size())
+		? _extended->links[index - 1]
+		: kEmpty;
+}
+
 TextSelection String::linkRangeFor(const ClickHandlerPtr &link) const {
 	if (!_extended || !link) {
 		return {};
@@ -845,16 +873,14 @@ bool String::hasCustomEmoji() const {
 
 void String::setCustomEmojiClickHandler(
 		Fn<bool(QStringView)> predicate,
-		Fn<void(QStringView, ClickContext)> callback) {
-	if (!_hasCustomEmoji) {
-		return;
-	}
+		Fn<void(QStringView, ClickContext)> callback,
+		Fn<CustomEmojiLinkTexts(QStringView)> texts) {
 	const auto extended = ensureExtended();
-	extended->customEmoji = std::make_unique<CustomEmojiData>();
-	const auto data = extended->customEmoji.get();
+	extended->customEmoji = std::make_shared<CustomEmojiData>();
+	const auto &data = extended->customEmoji;
 	data->predicate = std::move(predicate);
 	data->callback = std::move(callback);
-	data->link = std::make_shared<CustomEmojiClickHandler>(data);
+	data->texts = std::move(texts);
 }
 
 void String::setBlockquoteExpandCallback(
@@ -893,6 +919,7 @@ bool String::blockquoteExpanded(int index) const {
 }
 
 void String::setBlockquoteExpanded(int index, bool expanded) {
+	_layoutId = NextLayoutId();
 	Expects(_extended && _extended->quotes);
 	Expects(index > 0 && index <= _extended->quotes->list.size());
 
@@ -916,6 +943,7 @@ bool String::updateSkipBlock(int width, int height) {
 	if (!width || !height) {
 		return removeSkipBlock();
 	}
+	_layoutId = NextLayoutId();
 	if (!_blocks.empty() && _blocks.back()->type() == TextBlockType::Skip) {
 		const auto &block = _blocks.back().unsafe<SkipBlock>();
 		if (block.width() == width && block.height() == height) {
@@ -956,7 +984,9 @@ bool String::updateSkipBlock(int width, int height) {
 bool String::removeSkipBlock() {
 	if (_blocks.empty() || _blocks.back()->type() != TextBlockType::Skip) {
 		return false;
-	} else if (_skipBlockAddedNewline) {
+	}
+	_layoutId = NextLayoutId();
+	if (_skipBlockAddedNewline) {
 		const auto size = _blocks.back()->position() - 1;
 		_text.resize(size);
 		_blocks.pop_back();
@@ -1052,7 +1082,7 @@ String::DimensionsResult String::countDimensions(
 	}
 	enumerateLines(
 		geometry,
-		[&](QFixed lineWidth, int lineBottom, int, int, bool) {
+		[&](Fixed lineWidth, int lineBottom, int, int, bool) {
 			const auto width = lineWidth.ceil().toInt();
 			if (request.lineWidths) {
 				result.lineWidths.push_back(width);
@@ -1065,15 +1095,15 @@ String::DimensionsResult String::countDimensions(
 }
 
 QSize String::countSize(int width, bool breakEverywhere) const {
-	if (QFixed(width) >= _maxWidth) {
+	if (Fixed(width) >= _maxWidth) {
 		return { _maxWidth, _minHeight };
 	}
 	auto height = 0;
-	auto maxLineWidth = QFixed(0);
+	auto maxLineWidth = Fixed(0);
 	enumerateLines(
 		width,
 		breakEverywhere,
-		[&](QFixed lineWidth, int lineBottom, int, int, bool) {
+		[&](Fixed lineWidth, int lineBottom, int, int, bool) {
 			if (lineWidth > maxLineWidth) {
 				maxLineWidth = lineWidth;
 			}
@@ -1104,7 +1134,7 @@ std::vector<int> String::countLineWidths(
 	enumerateLines(
 		width,
 		options.breakEverywhere,
-		[&](QFixed lineWidth, int, int, int, bool) {
+		[&](Fixed lineWidth, int, int, int, bool) {
 			result.push_back(lineWidth.ceil().toInt());
 		});
 	return result;
@@ -1118,7 +1148,7 @@ std::vector<LineLayoutInfo> String::countLinesGeometry(
 		width,
 		breakEverywhere,
 		[&](
-				QFixed lineWidth,
+				Fixed lineWidth,
 				int lineBottom,
 				int lineLeft,
 				int lineBaseline,
@@ -1173,7 +1203,7 @@ void String::enumerateLines(
 	auto lineLeft = 0;
 	auto lineWidth = 0;
 	auto lineElided = false;
-	auto widthLeft = QFixed(0);
+	auto widthLeft = Fixed(0);
 	auto lineIndex = 0;
 	const auto initNextLine = [&] {
 		const auto line = geometry.layout(lineIndex++);
@@ -1210,8 +1240,8 @@ void String::enumerateLines(
 		initNextParagraph(_startQuoteIndex, 0);
 	}
 
-	auto last_rBearing = QFixed();
-	auto last_rPadding = QFixed();
+	auto last_rBearing = Fixed();
+	auto last_rPadding = Fixed();
 	auto longWordLine = true;
 	auto lastWordStart = begin(_words);
 	auto lastWordStart_wLeft = widthLeft;
@@ -1229,7 +1259,7 @@ void String::enumerateLines(
 				--qlinesleft;
 			}
 			if (!hidden) {
-				const auto lineGeometry = resolveLineGeometry(
+				const auto lineGeometry = resolveLineMetrics(
 					lineStart,
 					w->position(),
 					lineStartBlockHint);
@@ -1238,7 +1268,7 @@ void String::enumerateLines(
 					lineLeft + lineWidth - widthLeft,
 					top,
 					lineLeft + qpadding.left(),
-					top - lineGeometry.descent,
+					(top - lineGeometry.descent).toInt(),
 					paragraphRTL);
 			}
 			if (lineElided) {
@@ -1251,9 +1281,11 @@ void String::enumerateLines(
 			paragraphRTL = resolveRTL(static_cast<const NewlineBlock*>(
 				_blocks[block].get())->paragraphDirection());
 			lineStartBlockHint = block + 1;
-			initNextParagraph(index, w->position());
+			initNextParagraph(
+				index,
+				blockPosition(begin(_blocks) + lineStartBlockHint));
 			longWordLine = true;
-			lastWordStart = w;
+			lastWordStart = w + 1;
 			lastWordStart_wLeft = widthLeft;
 			continue;
 		} else if (!qlinesleft) {
@@ -1266,7 +1298,12 @@ void String::enumerateLines(
 		const auto newWidthLeft = widthLeft
 			- last_rBearing
 			- (last_rPadding + w__f_width - w__f_rbearing);
-		if (newWidthLeft >= 0) {
+		// A word starting the line is laid out on it even when it doesn't
+		// fit: rolling it over would leave an empty line that the renderer
+		// never paints. This wrapping must mirror Renderer::enumerate(),
+		// otherwise the counted height diverges from the painted one.
+		if (newWidthLeft >= 0
+			|| (w->position() == lineStart && !lineElided)) {
 			last_rBearing = w__f_rbearing;
 			last_rPadding = w->f_rpadding();
 			widthLeft = newWidthLeft;
@@ -1291,7 +1328,7 @@ void String::enumerateLines(
 		if (qlinesleft > 0) {
 			--qlinesleft;
 		}
-		const auto lineGeometry = resolveLineGeometry(
+		const auto lineGeometry = resolveLineMetrics(
 			lineStart,
 			w->position(),
 			lineStartBlockHint);
@@ -1300,7 +1337,7 @@ void String::enumerateLines(
 			lineLeft + lineWidth - widthLeft,
 			top,
 			lineLeft + qpadding.left(),
-			top - lineGeometry.descent,
+			(top - lineGeometry.descent).toInt(),
 			paragraphRTL);
 		if (lineElided) {
 			return withElided(true);
@@ -1323,7 +1360,7 @@ void String::enumerateLines(
 		lastWordStart_wLeft = widthLeft;
 	}
 	if (widthLeft < lineWidth) {
-		const auto lineGeometry = resolveLineGeometry(
+		const auto lineGeometry = resolveLineMetrics(
 			lineStart,
 			_text.size(),
 			lineStartBlockHint);
@@ -1344,7 +1381,7 @@ void String::enumerateLines(
 			lineLeft + lineWidth - widthLeft,
 			top + useLineHeight + qpadding.bottom(),
 			lineLeft + qpadding.left(),
-			top + std::min(lineGeometry.ascent, useLineHeight),
+			top + std::min(lineGeometry.ascent.toInt(), useLineHeight),
 			paragraphRTL);
 	}
 	return withElided(false);
@@ -1509,16 +1546,16 @@ TextSelection String::adjustSelection(TextSelection selection, TextSelectType se
 				}
 			}
 		} else if (selectType == TextSelectType::Words) {
-			if (!IsWordSeparator(_text.at(from))) {
-				while (from > 0 && !IsWordSeparator(_text.at(from - 1))) {
+			if (!IsWordSeparator(_text, from)) {
+				while (from > 0 && !IsWordSeparator(_text, from - 1)) {
 					--from;
 				}
 			}
 			if (to < _text.size()) {
-				if (IsWordSeparator(_text.at(to))) {
+				if (IsWordSeparator(_text, to)) {
 					++to;
 				} else {
-					while (to < _text.size() && !IsWordSeparator(_text.at(to))) {
+					while (to < _text.size() && !IsWordSeparator(_text, to)) {
 						++to;
 					}
 				}
@@ -1651,16 +1688,37 @@ const QString &String::quoteHeaderText(QuoteDetails *quote) const {
 		: quote->language;
 }
 
-int String::blockBaselineShift(const AbstractBlock *block) const {
+Fixed String::blockBaselineShift(const AbstractBlock *block) const {
 	const auto flags = block->flags();
-	return (flags & TextBlockFlag::Subscript)
-		? int(base::SafeRound(_st->font->size() / 4.))
-		: (flags & TextBlockFlag::Superscript)
-		? -int(base::SafeRound(_st->font->size() / 3.))
-		: 0;
+	const auto subscript = (flags & TextBlockFlag::Subscript);
+	const auto superscript = (flags & TextBlockFlag::Superscript);
+	if (!subscript && !superscript) {
+		return Fixed();
+	} else if (_st->qtextEditLineMetrics) {
+		const auto font = WithFlags(_st->font, flags);
+		const auto &metrics = font->metrics();
+		const auto height = Fixed::FromReal(
+			metrics.ascent() + metrics.descent());
+		return subscript ? (height / 6) : -(height / 2);
+	}
+	return subscript
+		? Fixed(int(base::SafeRound(_st->font->size() / 4.)))
+		: -Fixed(int(base::SafeRound(_st->font->size() / 3.)));
 }
 
-String::LineGeometry String::defaultLineGeometry() const {
+String::LineMetrics String::defaultLineMetrics() const {
+	if (_st->qtextEditLineMetrics) {
+		const auto lineHeight = Fixed(this->lineHeight());
+		const auto leading = std::max(_st->font->fleading, Fixed());
+		const auto ascent = std::clamp(
+			(lineHeight * 4 / 5) - leading,
+			Fixed(),
+			lineHeight);
+		return {
+			.ascent = ascent,
+			.descent = lineHeight - ascent,
+		};
+	}
 	const auto lineHeight = this->lineHeight();
 	const auto fontHeight = _st->font->height;
 	const auto top = std::max(lineHeight - fontHeight, 0) / 2;
@@ -1670,11 +1728,11 @@ String::LineGeometry String::defaultLineGeometry() const {
 	};
 }
 
-String::LineGeometry String::resolveLineGeometry(
+String::LineMetrics String::resolveLineMetrics(
 		int lineStart,
 		int lineEnd,
 		int blockIndexHint) const {
-	auto result = defaultLineGeometry();
+	auto result = defaultLineMetrics();
 	if (lineStart >= lineEnd) {
 		return result;
 	}
@@ -1687,13 +1745,15 @@ String::LineGeometry String::resolveLineGeometry(
 		const auto raw = i->get();
 		const auto flags = raw->flags();
 		if (_hasSubscriptsOrSuperscripts
+			&& !_st->qtextEditLineMetrics
 			&& (raw->type() == TextBlockType::Text)
 			&& (flags
 				& (TextBlockFlag::Subscript | TextBlockFlag::Superscript))) {
 			const auto font = WithFlags(_st->font, raw->flags());
 			const auto shift = blockBaselineShift(raw);
-			accumulate_max(result.ascent, font->ascent - shift);
-			accumulate_max(result.descent, font->descent + shift);
+			const auto descent = font->height - font->fascent;
+			accumulate_max(result.ascent, font->fascent - shift);
+			accumulate_max(result.descent, descent + shift);
 		}
 		const auto custom = BlockCustomEmoji(raw);
 		if (!custom) {
@@ -1703,8 +1763,8 @@ String::LineGeometry String::resolveLineGeometry(
 		if (!vertical) {
 			continue;
 		}
-		accumulate_max(result.ascent, vertical->ascent);
-		accumulate_max(result.descent, vertical->descent);
+		accumulate_max(result.ascent, Fixed(vertical->ascent));
+		accumulate_max(result.descent, Fixed(vertical->descent));
 	}
 	return result;
 }
@@ -1781,14 +1841,12 @@ void String::enumerateText(
 				return 0;
 			}
 			const auto result = (*i)->linkIndex();
-			return (result && _extended && _extended->links[result - 1])
-				? result
-				: 0;
+			return linkByIndex(result) ? result : 0;
 		}();
 		if (blockLinkIndex != linkIndex) {
 			if (linkIndex) {
-				auto rangeFrom = qMax(selection.from, linkPosition);
-				auto rangeTo = qMin(selection.to, blockPosition);
+				auto rangeFrom = std::max(selection.from, linkPosition);
+				auto rangeTo = std::min(selection.to, blockPosition);
 				if (rangeTo > rangeFrom) { // handle click handler
 					const auto r = base::StringViewMid(
 						_text,
@@ -1796,10 +1854,9 @@ void String::enumerateText(
 						rangeTo - rangeFrom);
 					// Ignore links that are partially copied.
 					const auto handler = (linkPosition != rangeFrom
-						|| blockPosition != rangeTo
-						|| !_extended)
+						|| blockPosition != rangeTo)
 						? nullptr
-						: _extended->links[linkIndex - 1];
+						: linkByIndex(linkIndex);
 					const auto type = handler
 						? handler->getTextEntity().type
 						: EntityType::Invalid;
@@ -1809,9 +1866,7 @@ void String::enumerateText(
 			linkIndex = blockLinkIndex;
 			if (linkIndex) {
 				linkPosition = blockPosition;
-				const auto handler = _extended
-					? _extended->links[linkIndex - 1]
-					: nullptr;
+				const auto &handler = linkByIndex(linkIndex);
 				clickHandlerStartCallback(handler
 					? handler->getTextEntity().type
 					: EntityType::Invalid);
@@ -1842,8 +1897,8 @@ void String::enumerateText(
 			continue;
 		}
 
-		auto rangeFrom = qMax(selection.from, blockPosition);
-		auto rangeTo = qMin(
+		auto rangeFrom = std::max(selection.from, blockPosition);
+		auto rangeTo = std::min(
 			selection.to,
 			uint16(blockPosition + blockLength(i)));
 		if (rangeTo > rangeFrom) {
@@ -1852,14 +1907,19 @@ void String::enumerateText(
 				const auto semantics = custom->semantics();
 				if (!semantics.exportEntity) {
 					const auto replacement = custom->replacementText();
+					const auto empty = replacement.isEmpty();
 					appendPartCallback(
-						replacement.isEmpty()
+						empty
 							? base::StringViewMid(
 								_text,
 								rangeFrom,
 								rangeTo - rangeFrom)
 							: QStringView(replacement),
-						QString());
+						custom->entityData(),
+						false,
+						empty
+							? EntitiesInText()
+							: custom->replacementEntities());
 					continue;
 				}
 			}
@@ -1868,7 +1928,9 @@ void String::enumerateText(
 				: QString();
 			appendPartCallback(
 				base::StringViewMid(_text, rangeFrom, rangeTo - rangeFrom),
-				customEmojiData);
+				customEmojiData,
+				true,
+				EntitiesInText());
 		}
 	}
 }
@@ -2049,21 +2111,30 @@ TextForMimeData String::toText(
 		const auto plainUrl = (entity.type == EntityType::Url)
 			|| (entity.type == EntityType::Email)
 			|| (entity.type == EntityType::BankCard)
+			|| (entity.type == EntityType::TonAddress)
 			|| (entity.type == EntityType::Phone);
 		const auto inText = QStringView(result.rich.text).mid(linkStart);
 		const auto full = plainUrl
 			? QStringView(entity.data).mid(0, entity.data.size())
 			: inText;
 		const auto customTextLink = (entity.type == EntityType::CustomUrl);
+		auto entityData = entity.data;
+		if (customTextLink) {
+			if (const auto external = UrlClickHandler::ExternalUrlFromInternalUrl(
+					entityData);
+					!external.isEmpty()) {
+				entityData = external;
+			}
+		}
 		const auto internalLink = customTextLink
-			&& entity.data.startsWith(qstr("internal:"));
+			&& entityData.startsWith(u"internal:"_q);
 		if (composeExpanded) {
 			const auto sameAsTextLink = customTextLink
-				&& (entity.data
+				&& (entityData
 					== UrlClickHandler::EncodeForOpening(full.toString()));
 			if (customTextLink && !internalLink && !sameAsTextLink) {
-				const auto &url = entity.data;
-				result.expanded.append(qstr(" (")).append(url).append(')');
+				const auto &url = entityData;
+				result.expanded.append(u" ("_q).append(url).append(')');
 			}
 		}
 		if (composeEntities && !internalLink) {
@@ -2071,23 +2142,46 @@ TextForMimeData String::toText(
 				entity.type,
 				linkStart,
 				int(result.rich.text.size() - linkStart),
-				entity.data });
+				entityData });
 		}
 	};
 	const auto appendPartCallback = [&](
 			QStringView part,
-			const QString &customEmojiData) {
+			const QString &customEmojiData,
+			bool exportCustomEmojiEntity,
+			const EntitiesInText &replacementEntities) {
+		const auto offset = int(result.rich.text.size());
 		result.rich.text += part;
 		if (composeExpanded) {
 			result.expanded += part;
 		}
-		if (composeEntities && !customEmojiData.isEmpty()) {
+		if (composeExpanded
+			&& IsIvFormulaCustomEmojiData(customEmojiData)
+			&& !part.isEmpty()) {
+			result.tags.push_back({
+				.offset = offset,
+				.length = int(part.size()),
+				.id = Ui::InputField::kTagIvMath,
+			});
+		}
+		if (composeEntities && exportCustomEmojiEntity
+			&& !customEmojiData.isEmpty()) {
 			insertEntity({
 				EntityType::CustomEmoji,
-				int(result.rich.text.size() - part.size()),
+				offset,
 				int(part.size()),
 				customEmojiData,
 			});
+		}
+		if (composeEntities) {
+			for (const auto &entity : replacementEntities) {
+				insertEntity({
+					entity.type(),
+					offset + entity.offset(),
+					entity.length(),
+					entity.data(),
+				});
+			}
 		}
 	};
 
@@ -2156,10 +2250,15 @@ IsolatedEmoji String::toIsolatedEmoji() const {
 }
 
 int String::lineHeight() const {
-	return _st->lineHeight ? _st->lineHeight : _st->font->height;
+	return _st->qtextEditLineMetrics
+		? std::max(_st->lineHeight, _st->font->height)
+		: _st->lineHeight
+		? _st->lineHeight
+		: _st->font->height;
 }
 
 void String::clear() {
+	_layoutId = NextLayoutId();
 	_text.clear();
 	_blocks.clear();
 	_extended = nullptr;
@@ -2233,6 +2332,48 @@ bool IsWordSeparator(QChar ch) {
 		break;
 	}
 	return false;
+}
+
+// Given the neighbours, unlike the one above, an apostrophe can be seen for
+// what it is: a part of the word it stands in, so that "don't" is one word,
+// and a separator only when it is doubled or stands at the edge of a word -
+// the same rule the patched Qt applies in QTextEngine::toEdge().
+template <typename At>
+[[nodiscard]] bool IsWordSeparatorWith(At &&at, int length, int position) {
+	if (position < 0 || position >= length) {
+		return true;
+	}
+	const auto ch = at(position);
+	const auto unicode = ch.unicode();
+	const auto apostrophe = (unicode == '\'')
+		|| (unicode == 0x2018) // left single quotation mark
+		|| (unicode == 0x2019); // right single quotation mark
+	if (!apostrophe) {
+		return IsWordSeparator(ch);
+	}
+
+	// A doubled apostrophe is just the case of the neighbour being one, and
+	// the list above already calls an apostrophe a separator, so both that
+	// and the edge of a word are the same question asked to the sides.
+	const auto edge = [&](int index) {
+		return (index < 0)
+			|| (index >= length)
+			|| IsWordSeparator(at(index));
+	};
+	return edge(position - 1) || edge(position + 1);
+}
+
+bool IsWordSeparator(const QString &text, int position) {
+	return IsWordSeparatorWith(
+		[&](int index) { return text.at(index); },
+		int(text.size()),
+		position);
+}
+
+// For the text that is not in a string of its own - a block of a document is
+// read a character at a time instead of being copied for every question.
+bool IsWordSeparator(Fn<QChar(int)> at, int length, int position) {
+	return IsWordSeparatorWith(at, length, position);
 }
 
 bool IsAlmostLinkEnd(QChar ch) {

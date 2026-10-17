@@ -6,13 +6,17 @@
 //
 #include "ui/widgets/rp_window.h"
 
+#include "ui/gl/gl_surface.h"
 #include "ui/platform/ui_platform_window.h"
 
 namespace Ui {
 
 RpWindow::RpWindow(QWidget *parent)
 : RpWidget(parent)
-, _helper(Platform::CreateWindowHelper(this)) {
+, _helper([&] {
+	GL::EnsureWindowRhi(this);
+	return Platform::CreateWindowHelper(this);
+}()) {
 	Expects(_helper != nullptr);
 
 	_helper->initInWindow(this);
@@ -26,6 +30,7 @@ RpWindow::RpWindow(bool translucent, QWidget *parent)
 		setAttribute(Qt::WA_NoSystemBackground, true);
 		setAttribute(Qt::WA_TranslucentBackground, true);
 	}
+	GL::EnsureWindowRhi(this);
 	return Platform::CreateWindowHelper(this);
 }()) {
 	Expects(_helper != nullptr);
@@ -42,6 +47,14 @@ not_null<RpWidget*> RpWindow::body() {
 
 not_null<const RpWidget*> RpWindow::body() const {
 	return _helper->body().get();
+}
+
+RpWidget *RpWindow::titleWidget() {
+	return _helper->titleWidget();
+}
+
+const RpWidget *RpWindow::titleWidget() const {
+	return _helper->titleWidget();
 }
 
 QMargins RpWindow::frameMargins() const {

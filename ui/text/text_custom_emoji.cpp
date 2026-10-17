@@ -7,6 +7,7 @@
 #include "ui/text/text_custom_emoji.h"
 
 #include "ui/style/style_core.h"
+#include "ui/style/style_core_palette.h"
 #include "ui/text/text.h"
 #include "ui/text/text_utilities.h"
 #include "ui/emoji_config.h"
@@ -50,6 +51,7 @@ ShiftedEmoji::ShiftedEmoji(
 	QPoint shift)
 : _wrapped(std::move(wrapped))
 , _shift(shift) {
+	Expects(_wrapped != nullptr);
 }
 
 int ShiftedEmoji::width() {
@@ -67,6 +69,10 @@ std::optional<CustomEmojiVerticalMetrics> ShiftedEmoji::vertical(
 
 QString ShiftedEmoji::replacementText() {
 	return _wrapped->replacementText();
+}
+
+EntitiesInText ShiftedEmoji::replacementEntities() {
+	return _wrapped->replacementEntities();
 }
 
 CustomEmojiSemantics ShiftedEmoji::semantics() {
@@ -93,6 +99,7 @@ bool ShiftedEmoji::readyInDefaultState() {
 
 FirstFrameEmoji::FirstFrameEmoji(std::unique_ptr<CustomEmoji> wrapped)
 : _wrapped(std::move(wrapped)) {
+	Expects(_wrapped != nullptr);
 }
 
 int FirstFrameEmoji::width() {
@@ -110,6 +117,10 @@ std::optional<CustomEmojiVerticalMetrics> FirstFrameEmoji::vertical(
 
 QString FirstFrameEmoji::replacementText() {
 	return _wrapped->replacementText();
+}
+
+EntitiesInText FirstFrameEmoji::replacementEntities() {
+	return _wrapped->replacementEntities();
 }
 
 CustomEmojiSemantics FirstFrameEmoji::semantics() {
@@ -142,6 +153,7 @@ LimitedLoopsEmoji::LimitedLoopsEmoji(
 : _wrapped(std::move(wrapped))
 , _limit(limit)
 , _stopOnLast(stopOnLast) {
+	Expects(_wrapped != nullptr);
 }
 
 int LimitedLoopsEmoji::width() {
@@ -159,6 +171,10 @@ std::optional<CustomEmojiVerticalMetrics> LimitedLoopsEmoji::vertical(
 
 QString LimitedLoopsEmoji::replacementText() {
 	return _wrapped->replacementText();
+}
+
+EntitiesInText LimitedLoopsEmoji::replacementEntities() {
+	return _wrapped->replacementEntities();
 }
 
 CustomEmojiSemantics LimitedLoopsEmoji::semantics() {
@@ -265,8 +281,12 @@ bool PaletteDependentCustomEmoji::readyInDefaultState() {
 
 void PaletteDependentCustomEmoji::validateFrame() {
 	const auto version = style::PaletteVersion();
-	if (_frame.isNull() || _paletteVersion != version) {
+	const auto overridden = style::main_palette::CurrentOverride();
+	if (_frame.isNull()
+		|| _paletteVersion != version
+		|| _paletteOverride != overridden) {
 		_paletteVersion = version;
+		_paletteOverride = overridden;
 		_frame = _factory();
 	}
 }

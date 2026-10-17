@@ -446,6 +446,12 @@ void LayerStackWidget::hideLayers(anim::type animated) {
 }
 
 void LayerStackWidget::hideAll(anim::type animated) {
+	if (animated == anim::type::normal
+		&& !layerShown()
+		&& _background->animating()) {
+		// Already hiding, new cache images would lose the hiding ones.
+		return;
+	}
 	const auto duration = (animated == anim::type::normal)
 		? currentLayer()
 			? currentLayer()->animationDuration()
@@ -489,6 +495,17 @@ void LayerStackWidget::hideTopLayer(anim::type animated) {
 	}
 }
 
+bool LayerStackWidget::closeCurrentByBackButton() {
+	if (const auto layer = currentLayer()) {
+		return layer->closeByBackButton();
+	} else if (const auto special = _specialLayer.data()) {
+		return special->closeByBackButton();
+	} else if (const auto menu = _mainMenu.data()) {
+		return menu->closeByBackButton();
+	}
+	return false;
+}
+
 void LayerStackWidget::removeBodyCache() {
 	_background->removeBodyCache();
 	setAttribute(Qt::WA_OpaquePaintEvent, false);
@@ -496,6 +513,18 @@ void LayerStackWidget::removeBodyCache() {
 
 bool LayerStackWidget::layerShown() const {
 	return _specialLayer || currentLayer() || _mainMenu;
+}
+
+bool LayerStackWidget::boxShown() const {
+	return currentLayer() != nullptr;
+}
+
+rpl::producer<bool> LayerStackWidget::boxShownValue() const {
+	return _boxShown.value();
+}
+
+void LayerStackWidget::updateBoxShown() {
+	_boxShown = (currentLayer() != nullptr);
 }
 
 const LayerWidget *LayerStackWidget::topShownLayer() const {
@@ -871,6 +900,7 @@ LayerWidget *LayerStackWidget::pushLayer(
 		}, Action::ShowLayer, animated);
 	}
 
+	updateBoxShown();
 	return raw;
 }
 
@@ -923,6 +953,7 @@ void LayerStackWidget::clearLayers() {
 		std::make_move_iterator(begin(_layers)),
 		std::make_move_iterator(end(_layers)));
 	_layers.clear();
+	updateBoxShown();
 	clearClosingLayers();
 }
 
